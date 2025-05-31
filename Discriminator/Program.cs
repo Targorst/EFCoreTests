@@ -1,5 +1,8 @@
-using System.Text.Json;
+using System.Reflection;
 using System.Text.Json.Serialization;
+using Discriminator;
+using Mapster;
+using MediatR;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 
@@ -8,6 +11,12 @@ var builder = WebApplication.CreateBuilder(args);
 // Add services to the container.
 // Learn more about configuring OpenAPI at https://aka.ms/aspnet/openapi
 builder.Services.AddOpenApi();
+builder.Services.AddMapster();
+builder.Services.AddMediatR(x =>
+{
+    x.RegisterServicesFromAssembly(Assembly.GetEntryAssembly());
+    x.RegisterGenericHandlers = true;
+});
 builder.Services.AddDbContext<TransformationsContext>(options =>
 {
     options.EnableDetailedErrors();
@@ -27,12 +36,26 @@ app.UseHttpsRedirection();
 
 // !!! В ТЕЛЕ POST Запроса первым параметров всегда должен быть тот параметр,
 // !!! на основе которого резолвится зависимость.
-app.MapPost("/transformation", (TransformationsContext context, [FromBody] ITransformationProperties properties) =>
+app.MapPost("/transformation", async (
+        TransformationsContext context,
+        IMediator mediator,
+        [FromBody] CreateTransformationDto createTransformation) =>
     {
-        var transformation = new Transformation<DivisionTransformationProperties>((DivisionTransformationProperties)properties, "Альфа");
+        var command = CreateGenericTypeInstance(createTransformation.Properties);
+
+        static object CreateGenericTypeInstance(ITransformationProperties properties)
+        {
+            Type[] typeArgs = [properties.GetType()];
+            var type = typeof(CreateTransformationGenericCommand<>).MakeGenericType(typeArgs);
+
+            var transformationCommand = Activator.CreateInstance(type, args: [properties]);
+            return transformationCommand ?? throw new InvalidOperationException($"Could not create command of type {type}");
+        }
         
-        context.Transformations.Add(transformation);
-        context.SaveChanges();
+        await mediator.Send(command);
+        
+        // context.Transformations.Add(transformation);
+        // context.SaveChanges();
         
         var result1 = context.Multiply
             .ToList();
@@ -50,103 +73,24 @@ app.MapPost("/transformation", (TransformationsContext context, [FromBody] ITran
 
 app.Run();
 
-public abstract class TransformationBase
+public record CreateTransformationDto
 {
-    public TransformationType TransformationType { get; init; }
-
-    public string Name { get; init; }
+    public ITransformationProperties Properties { get; init; }
 }
 
-public class Transformation<T> : TransformationBase where T : ITransformationProperties
+public record CreateTransformationGenericCommand<T>(T Properties) : IRequest where T : class, ITransformationProperties;
+
+public record CreateTransformationGenericCommandHandler<T>
+    : IRequestHandler<CreateTransformationGenericCommand<T>> where T : class, ITransformationProperties
 {
-    public Transformation(T properties, string name)
+    private readonly TransformationsContext _context;
+    
+    public CreateTransformationGenericCommandHandler(TransformationsContext context) => _context = context;
+    
+    public async Task Handle(CreateTransformationGenericCommand<T> request, CancellationToken ct)
     {
-        Properties = properties;
-        Name = name;
+        var transformation = new Transformation<T>(request.Properties, "456");
+        _context.Transformations.Add(transformation);
+        await _context.SaveChangesAsync(ct);
     }
-    
-    public T Properties { get; init; }
-}
-
-public enum TransformationType
-{
-    Divide,
-    Multiply
-}
-
-public class TransformationsContext(DbContextOptions<TransformationsContext> options) : DbContext(options)
-{
-    public DbSet<TransformationBase> Transformations { get; set; }
-    
-    public DbSet<Transformation<DivisionTransformationProperties>> Divide { get; set; }
-    
-    public DbSet<Transformation<MultiplyTransformationProperties>> Multiply { get; set; }
-
-    protected override void OnModelCreating(ModelBuilder modelBuilder)
-    {
-        modelBuilder
-            .Entity<TransformationBase>()
-            .ToTable("transformations");
-
-        modelBuilder.Entity<TransformationBase>()
-            .HasKey(x => x.Name);
-        
-        modelBuilder.Entity<TransformationBase>()
-            .Property(x => x.Name)
-            .HasColumnName("name");
-
-        modelBuilder
-            .Entity<TransformationBase>()
-            .Property(x => x.TransformationType)
-            .HasColumnName("transformationtype");
-
-        modelBuilder.Entity<TransformationBase>()
-            .HasDiscriminator(x => x.TransformationType)
-            .HasValue<Transformation<DivisionTransformationProperties>>(TransformationType.Divide)
-            .HasValue<Transformation<MultiplyTransformationProperties>>(TransformationType.Multiply);
-        
-        modelBuilder.Entity<Transformation<MultiplyTransformationProperties>>()
-            .Property(x => x.Properties)
-            .HasColumnName("properties")
-            .HasConversion<string>(
-                x => JsonSerializer.Serialize(x, JsonSerializerOptions.Default),
-                x => JsonSerializer.Deserialize<MultiplyTransformationProperties>(x, JsonSerializerOptions.Default));
-        
-        modelBuilder.Entity<Transformation<DivisionTransformationProperties>>()
-            .Property(x => x.Properties)
-            .HasColumnName("properties")
-            .HasConversion<string>(
-                x => JsonSerializer.Serialize(x, JsonSerializerOptions.Default),
-                x => JsonSerializer.Deserialize<DivisionTransformationProperties>(x, JsonSerializerOptions.Default));
-    }
-}
-
-[JsonPolymorphic(TypeDiscriminatorPropertyName = "TransformationType")]
-[JsonDerivedType(typeof(DivisionTransformationProperties), typeDiscriminator: "Divide")]
-[JsonDerivedType(typeof(MultiplyTransformationProperties), typeDiscriminator: "Multiply")]
-public interface ITransformationProperties
-{
-    public TransformationType TransformationType { get; }
-}
-
-public class DivisionTransformationProperties : ITransformationProperties
-{
-    public TransformationType TransformationType => TransformationType.Divide;
-
-    public int DivideBy { get; init; }
-
-    public int NumberOne { get; init; }
-    
-    public int NumberTwo { get; init; }
-}
-
-public class MultiplyTransformationProperties : ITransformationProperties
-{
-    public TransformationType TransformationType => TransformationType.Multiply;
-    
-    public int MultiplyOn { get; init; }
-
-    public int FirstNumber { get; init; }
-    
-    public int SecondNumber { get; init; }
 }
